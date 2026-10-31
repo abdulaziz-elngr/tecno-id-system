@@ -214,7 +214,7 @@ async function main() {
   }
 
   const subject = await db.subject.create({
-    data: { organizationId: org.id, name: "Mathematics" },
+    data: { organizationId: org.id, name: "Mathematics", code: "MATH" },
   });
 
   // --- Demo teachers ---
@@ -226,6 +226,10 @@ async function main() {
       phone: "+201000000001",
       isAssistant: false,
     },
+  });
+  // Subject -> Teacher: the demo teacher teaches Mathematics.
+  await db.teacherSubject.create({
+    data: { teacherId: teacher.id, subjectId: subject.id },
   });
   const assistant = await db.teacher.create({
     data: {
@@ -277,6 +281,7 @@ async function main() {
       data: {
         branchId: branch.id,
         gradeId: secondaryGrade3.id,
+        subjectId: subject.id,
         teacherId: teacher.id,
         assistantId: def.name === "G3" ? assistant.id : undefined,
         name: def.name,

@@ -16,7 +16,8 @@
 // ==========================================================
 
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
 }
 
 datasource db {
@@ -252,36 +253,66 @@ model Grade {
   stage    Stage     @relation(fields: [stageId], references: [id])
   groups   Group[]
   students Student[]
+  fees     GradeFee[]
 
   @@unique([stageId, name])
   @@index([stageId])
 }
 
-// Subjects remain as an independent, optional classification used by
-// Exams (e.g. "Math exam", "Science exam"). Groups are no longer tied
-// to a subject — a Group is purely a Stage/Grade cohort with its own
-// weekly schedule and capacity.
+// A Subject (e.g. Mathematics, Physics) is taught by Teachers and delivered
+// through Groups. Relationship chain:
+//   Subject -> Teacher (TeacherSubject, many-to-many, optional)
+//   Subject -> Group (Group.subjectId) -> Students (Student.groupId)
+// The Stage/Grade a subject is taught in is derived from its groups
+// (Group.gradeId -> Grade.stageId), so a subject can span several grades
+// without duplicating it. Exams also reference a subject.
 model Subject {
   id             String   @id @default(uuid())
   organizationId String
   name           String
+  code           String? // optional short code, e.g. "MATH" (unique per organization when set)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
   deletedAt      DateTime?
 
-  exams  Exam[]
+  exams           Exam[]
+  groups          Group[]
+  teacherSubjects TeacherSubject[]
 
   @@unique([organizationId, name])
+  @@unique([organizationId, code])
+}
+
+/// Declares that a Teacher is qualified/responsible for a Subject. This is
+/// descriptive staffing data: the teacher actually responsible for a given
+/// group stays Group.teacherId (single source of truth for exams, sessions
+/// and scheduling). A teacher may teach many subjects and a subject may
+/// have many teachers. Teacher records are reused — never duplicated.
+model TeacherSubject {
+  id        String   @id @default(uuid())
+  teacherId String
+  subjectId String
+  createdAt DateTime @default(now())
+
+  teacher Teacher @relation(fields: [teacherId], references: [id])
+  subject Subject @relation(fields: [subjectId], references: [id])
+
+  @@unique([teacherId, subjectId])
+  @@index([teacherId])
+  @@index([subjectId])
 }
 
 // A Group is a physical-room-free cohort of students: it belongs to
-// exactly one Grade, has its own capacity and weekly Schedule, and is
-// optionally assigned a teacher. Group capacity is the only capacity
+// exactly one Grade, is optionally tied to ONE Subject (Stage -> Grade ->
+// Subject -> Group), has its own capacity and weekly Schedule, and is
+// optionally assigned a teacher. subjectId is nullable so groups that
+// existed before subjects were attached keep working unchanged. Group capacity is the only capacity
 // concept left in the system (Rooms were removed entirely).
 model Group {
   id          String   @id @default(uuid())
   branchId    String
   gradeId     String
+  subjectId   String?
   teacherId   String?
   assistantId String?
   name        String
@@ -294,18 +325,26 @@ model Group {
 
   branch    Branch   @relation(fields: [branchId], references: [id])
   grade     Grade    @relation(fields: [gradeId], references: [id])
+  subject   Subject? @relation(fields: [subjectId], references: [id])
   teacher   Teacher? @relation("GroupTeacher", fields: [teacherId], references: [id])
   assistant Teacher? @relation("GroupAssistant", fields: [assistantId], references: [id])
 
   students    Student[]
   schedules   Schedule[]
   sessions    ClassSession[]
+  lessonPlans LessonPlan[]
   exams       Exam[]
   assignments Assignment[]
+  recitationSessions RecitationSession[]
 
-  @@unique([gradeId, name])
+  // The same group name (e.g. "G1") may exist once per subject within a
+  // grade: Math/G1 and Physics/G1 are different groups. Postgres treats
+  // NULL subjectIds as distinct, so uniqueness for legacy subject-less
+  // groups is additionally enforced in the API layer.
+  @@unique([gradeId, subjectId, name])
   @@index([branchId])
   @@index([gradeId])
+  @@index([subjectId])
   @@index([teacherId])
   @@index([assistantId])
 }
@@ -366,6 +405,7 @@ model Teacher {
   user            User?   @relation(fields: [userId], references: [id])
   groupsAsTeacher   Group[] @relation("GroupTeacher")
   groupsAsAssistant Group[] @relation("GroupAssistant")
+  teacherSubjects   TeacherSubject[]
 
   @@index([organizationId])
   @@index([branchId])
@@ -420,6 +460,7 @@ model Student {
   subscriptions         Subscription[]
   payments              Payment[]
   invoices              Invoice[]
+  recognitions          StudentRecognition[]
 
   @@index([organizationId])
   @@index([branchId])
@@ -566,19 +607,64 @@ model ClassSession {
   notes          String?
   openedAt       DateTime?
   closedAt       DateTime?
+  // Stage 2 — lesson formation. A session created from a monthly
+  // LessonPlan carries the plan it belongs to and its 1-based number
+  // inside that plan. Both stay NULL for sessions that pre-date lesson
+  // formation (they keep working exactly as before).
+  planId         String?
+  lessonNumber   Int?
+  openedById     String?
+  closedById     String?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
   group       Group        @relation(fields: [groupId], references: [id])
+  plan        LessonPlan?  @relation(fields: [planId], references: [id])
   attendances Attendance[]
+  // Stage 3 — performance pages: a lesson can carry one recitation and homework.
+  recitationSession RecitationSession?
+  assignments       Assignment[]
 
   // One session per group per date per start time — prevents accidental
   // double generation when the schedule generator is run twice.
   @@unique([groupId, date, startMinutes])
+  // A lesson number is unique inside its plan (NULL planIds never clash).
+  @@unique([planId, lessonNumber])
+  @@index([planId])
   @@index([organizationId])
   @@index([branchId])
   @@index([date])
   @@index([status])
+}
+
+/// Stage 2 — the monthly lesson plan of ONE group (تشكيل الحصص). It records
+/// which month/year the lessons were formed for and how many lessons per week
+/// were requested; the dated, numbered lessons themselves are ClassSession
+/// rows pointing back here via ClassSession.planId. Subject and teacher are
+/// not duplicated: the subject comes from Group.subjectId and the teacher is
+/// copied onto every ClassSession (ClassSession.teacherId) at creation time so
+/// history stays accurate if the group's teacher changes later.
+model LessonPlan {
+  id             String   @id @default(uuid())
+  organizationId String
+  branchId       String
+  groupId        String
+  year           Int
+  month          Int // 1–12
+  lessonsPerWeek Int
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  group    Group          @relation(fields: [groupId], references: [id])
+  sessions ClassSession[]
+
+  // One plan per group per calendar month — re-forming a month can never
+  // overwrite lesson history.
+  @@unique([groupId, year, month])
+  @@index([organizationId])
+  @@index([branchId])
+  @@index([year, month])
 }
 
 enum AttendanceType {
@@ -720,13 +806,47 @@ model Recitation {
   status         RecitationStatus
   notes          String?
   createdById    String?
+  // Stage 3 — set when the row is a student's result inside a RecitationSession
+  // (the new per-lesson recitation flow). NULL for free-form legacy records.
+  recitationSessionId String?
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
 
   student Student @relation(fields: [studentId], references: [id])
+  recitationSession RecitationSession? @relation(fields: [recitationSessionId], references: [id])
 
+  // One result per student per recitation session (NULLs never clash, so
+  // legacy rows are unaffected).
+  @@unique([recitationSessionId, studentId])
   @@index([organizationId])
   @@index([studentId])
+  @@index([date])
+}
+
+/// Stage 3 — a recitation (تسميع) held for ONE group during ONE lesson
+/// (ClassSession). It fixes the maximum score; each student's result is a
+/// Recitation row pointing back here. One recitation per lesson.
+model RecitationSession {
+  id             String   @id @default(uuid())
+  organizationId String
+  branchId       String
+  groupId        String
+  sessionId      String
+  title          String?
+  date           DateTime @db.Date
+  maxScore       Decimal  @default(10) @db.Decimal(5, 2)
+  notes          String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  group   Group        @relation(fields: [groupId], references: [id])
+  session ClassSession @relation(fields: [sessionId], references: [id])
+  records Recitation[]
+
+  @@unique([sessionId])
+  @@index([organizationId])
+  @@index([groupId])
   @@index([date])
 }
 
@@ -740,16 +860,21 @@ model Assignment {
   description    String?
   dueDate        DateTime
   maxScore       Decimal   @db.Decimal(6, 2)
+  // Stage 3 — the lesson (ClassSession) this homework belongs to. NULL for
+  // assignments created before the homework page was reworked.
+  sessionId      String?
   createdById    String?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
   deletedAt      DateTime?
 
   group       Group                  @relation(fields: [groupId], references: [id])
+  session     ClassSession?          @relation(fields: [sessionId], references: [id])
   submissions AssignmentSubmission[]
 
   @@index([organizationId])
   @@index([groupId])
+  @@index([sessionId])
   @@index([dueDate])
 }
 
@@ -780,6 +905,26 @@ model AssignmentSubmission {
   @@index([studentId])
 }
 
+/// Stage 3 — a teacher/admin recognising a student (Student performance page).
+/// Insert-only history: who was recognised, why, when, and any notes.
+model StudentRecognition {
+  id             String   @id @default(uuid())
+  organizationId String
+  branchId       String
+  studentId      String
+  reason         String
+  recognizedAt   DateTime @db.Date
+  notes          String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+
+  student Student @relation(fields: [studentId], references: [id])
+
+  @@index([organizationId])
+  @@index([studentId])
+  @@index([recognizedAt])
+}
+
 // ==========================================================
 // PHASE 7 — SUBSCRIPTIONS, PAYMENTS, INVOICES
 // ==========================================================
@@ -805,6 +950,29 @@ model SubscriptionFee {
 
   @@index([organizationId])
   @@index([stageId])
+  @@index([isActive])
+}
+
+/// Monthly subscription price per Grade (Stage -> Grade -> Price).
+/// History is append-only: changing a price creates a NEW row and flips the
+/// previous one to isActive=false. Rows are never updated or deleted, and
+/// Subscription rows copy the amount when they are created, so changing a
+/// price can never alter a past payment.
+model GradeFee {
+  id             String   @id @default(uuid())
+  organizationId String
+  gradeId        String
+  amount         Decimal  @db.Decimal(10, 2)
+  isActive       Boolean  @default(true)
+  effectiveFrom  DateTime @default(now())
+  notes          String?
+  createdById    String?
+  createdAt      DateTime @default(now())
+
+  grade Grade @relation(fields: [gradeId], references: [id])
+
+  @@index([organizationId])
+  @@index([gradeId, effectiveFrom])
   @@index([isActive])
 }
 
@@ -884,6 +1052,9 @@ model Payment {
   voidedById     String?
   voidedAt       DateTime?
   voidReason     String?
+  refundedById   String?
+  refundedAt     DateTime?
+  refundReason   String?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
@@ -942,7 +1113,11 @@ model Invoice {
 }
 
 // ==========================================================
-// PHASE 8 — EXPENSES & UTILITIES
+// PHASE 8 — EXPENSES & UTILITIES  (DEPRECATED — no code uses these)
+// The Expenses / Electricity / Water features were removed from the
+// application. The tables below are intentionally KEPT so any historical
+// financial rows already stored are never destroyed. They can be dropped
+// manually later, after the owner has exported the data.
 // ==========================================================
 
 enum ExpenseCategory {

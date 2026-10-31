@@ -2,9 +2,18 @@ import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { requirePermission, resolveBranchScope, ForbiddenError, UnauthorizedError } from "@/lib/rbac";
-import { generateStudentCode, buildQrPayload } from "@/lib/student-code";
+import { generateStudentCode, isStudentCodeConflict } from "@/lib/student-code";
 import { writeAuditLog } from "@/lib/audit";
-import { upsertParentForOrg } from "@/lib/scope";
+import {
+  GuardianInputError,
+  isParentPhoneConflict,
+  parentWhatsappSchema,
+  toStoredWhatsappNumber,
+  upsertGuardian
+} from "@/lib/student-parent";
+
+/** How many times a create is retried when another enrollment grabs the same barcode first. */
+const MAX_CODE_ATTEMPTS = 5;
 
 const listQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
@@ -27,7 +36,10 @@ const createStudentSchema = z.object({
   address: z.string().trim().max(500).optional(),
   school: z.string().trim().max(200).optional(),
   parentName: z.string().trim().min(1).max(200).optional(),
+  /** Guardian's contact phone. Optional: defaults to the WhatsApp number. */
   parentPhone: z.string().trim().min(3).max(30).optional(),
+  /** REQUIRED — the guardian's WhatsApp number (validated here, not just in the form). */
+  parentWhatsappNumber: parentWhatsappSchema,
   notes: z.string().trim().max(2000).optional(),
   emergencyContact: z.string().trim().max(200).optional(),
   /** Explicit administrator override to enroll past a full group's capacity (spec §3). */
@@ -40,6 +52,12 @@ function handleKnownErrors(err: unknown) {
   }
   if (err instanceof ForbiddenError) {
     return NextResponse.json({ error: err.message }, { status: 403 });
+  }
+  if (err instanceof GuardianInputError) {
+    return NextResponse.json(
+      { error: err.message, details: { fieldErrors: { [err.field]: [err.message] } } },
+      { status: 400 }
+    );
   }
   console.error("[students] internal error", err);
   return NextResponse.json(
@@ -178,42 +196,61 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const studentCode = await generateStudentCode();
-    const qrCode = buildQrPayload(studentCode);
+    const whatsappNumber = toStoredWhatsappNumber(input.parentWhatsappNumber);
 
-    const student = await db.$transaction(async (tx) => {
-      const created = await tx.student.create({
-        data: {
-          organizationId: ctx.organizationId,
-          branchId: input.branchId,
-          studentCode,
-          qrCode,
-          fullName: input.fullName,
-          gender: input.gender,
-          dateOfBirth: input.dateOfBirth ? new Date(input.dateOfBirth) : undefined,
-          phone: input.phone,
-          address: input.address,
-          school: input.school,
-          stageId: group.grade.stageId,
-          gradeId: group.gradeId,
-          groupId: group.id,
-          notes: input.notes,
-          emergencyContact: input.emergencyContact
+    // The barcode is a short numeric code (e.g. 260001). The database
+    // unique constraint is the real guarantee: if two enrollments race for
+    // the same number, the loser retries with the next free one.
+    const createWithUniqueBarcode = async () => {
+      for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt++) {
+        const studentCode = await generateStudentCode(attempt);
+        try {
+          return await db.$transaction(async (tx) => {
+            const created = await tx.student.create({
+              data: {
+                organizationId: ctx.organizationId,
+                branchId: input.branchId,
+                studentCode,
+                // The printed/scanned barcode IS the student code; keeping the
+                // legacy qrCode column identical means the two can never disagree.
+                qrCode: studentCode,
+                fullName: input.fullName,
+                gender: input.gender,
+                dateOfBirth: input.dateOfBirth ? new Date(input.dateOfBirth) : undefined,
+                phone: input.phone,
+                address: input.address,
+                school: input.school,
+                stageId: group.grade.stageId,
+                gradeId: group.gradeId,
+                groupId: group.id,
+                notes: input.notes,
+                emergencyContact: input.emergencyContact
+              }
+            });
+
+            // Reuses the existing Parent (matched by phone) when the guardian
+            // is already registered, e.g. a sibling — never a duplicate row.
+            const parent = await upsertGuardian(tx, ctx.organizationId, {
+              fullName: input.parentName,
+              phone: input.parentPhone,
+              whatsappNumber
+            });
+            await tx.studentParent.create({
+              data: { studentId: created.id, parentId: parent.id, relationship: "Guardian", isPrimary: true }
+            });
+
+            return created;
+          });
+        } catch (err) {
+          const raced = isStudentCodeConflict(err) || isParentPhoneConflict(err);
+          if (raced && attempt < MAX_CODE_ATTEMPTS - 1) continue;
+          throw err;
         }
-      });
-
-      if (input.parentPhone) {
-        const parent = await upsertParentForOrg(tx, ctx.organizationId, {
-          phone: input.parentPhone,
-          fullName: input.parentName
-        });
-        await tx.studentParent.create({
-          data: { studentId: created.id, parentId: parent.id, relationship: "Guardian", isPrimary: true }
-        });
       }
+      throw new Error("Could not generate a unique student code, please retry.");
+    };
 
-      return created;
-    });
+    const student = await createWithUniqueBarcode();
 
     await writeAuditLog({
       organizationId: ctx.organizationId,

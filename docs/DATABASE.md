@@ -12,7 +12,7 @@ Organization
   └─ Center
       └─ Branch
           ├─ Room
-          └─ Group ── Subject, AcademicLevel
+          └─ Group ── Subject (optional FK), Grade ── Stage
                 └─ GroupStudent ── Student
 ```
 
@@ -27,7 +27,7 @@ session via `requirePermission()` / `resolveBranchScope()` in
 - **Phase 1–2 (foundation)**: `Organization`, `Center`, `Branch`,
   `Room`, `User`, `Role`, `Permission`, `RolePermission`, `UserRole`,
   `UserBranch`, `Session`, `AcademicLevel`, `AcademicGrade`, `Subject`,
-  `Group`, `Schedule`, `Teacher`, `Student`, `Parent`, `StudentParent`,
+  `Group`, `Schedule`, `Teacher`, `TeacherSubject`, `Student`, `Parent`, `StudentParent`,
   `Employee`, `AuditLog`.
 - **Phase 5 — class sessions & attendance**: `ClassSession`,
   `Attendance`, `AttendanceAdjustment` (insert-only change trail).
@@ -87,3 +87,78 @@ npx prisma studio         # browse data in a local GUI
 has happened (every `db.<model>` call effectively becomes `any` and
 `tsc --noEmit` fills up with unrelated-looking implicit-`any` errors —
 that is the symptom, not a real bug in the affected files).
+
+## Stage 1 additions — Groups, Subjects, Teachers
+
+- `Group.subjectId` (nullable FK → `Subject`): Stage → Grade → Subject → Group.
+  Nullable only so groups that existed before this release keep working; the
+  API requires a subject for every NEW group and the UI flags legacy groups.
+- `Group` unique index is now `(gradeId, subjectId, name)` (was `(gradeId, name)`),
+  so "G1" can exist once per subject. Postgres treats NULL subjects as distinct,
+  so the API additionally rejects duplicate names (case-insensitive) per
+  grade+subject — including soft-deleted groups, which still occupy the index.
+- `Subject.code` (optional, unique per organization when set).
+- `TeacherSubject (teacherId, subjectId)`: which teachers teach which subject
+  (many-to-many, reuses the existing `Teacher` rows). `Group.teacherId` stays the
+  single source of truth for who runs a specific group; saving a group (or
+  assigning groups from the Teachers page) links that teacher to the group's
+  subject automatically, and a teacher who still runs a group of a subject
+  cannot be un-assigned from it.
+- Groups are never physically deleted when they have history: deletion is
+  allowed only if no students, sessions, attendance, exams, assignments or
+  subscriptions reference the group; otherwise archive (`isActive = false`).
+- Existing databases: apply `prisma/sql/2026-10-stage1-groups-subjects.sql`
+  (additive, idempotent). Fresh dev databases can use `prisma db push`.
+
+## Stage 2 additions — Lesson formation (تشكيل الحصص)
+
+- `LessonPlan (groupId, year, month, lessonsPerWeek)` — one row per group per
+  calendar month (`@@unique([groupId, year, month])`), so re-forming a month can
+  never overwrite lesson history. Subject and teacher are **not** duplicated:
+  the subject comes from `Group.subjectId`; the teacher is copied onto every
+  `ClassSession.teacherId` at creation so history survives a later teacher change.
+- `ClassSession` gains nullable `planId` (FK → `LessonPlan`, `ON DELETE SET NULL`),
+  `lessonNumber` (1-based inside the plan), `openedById`, `closedById`. Existing
+  sessions keep `NULL` in all four and work exactly as before.
+  `@@unique([planId, lessonNumber])` keeps numbers unique per plan (NULLs never clash).
+- Lesson status reuses `SessionStatus`: `SCHEDULED → OPEN → COMPLETED` (or `CANCELLED`).
+  `COMPLETED` is final; `closedAt`/`closedById` record who closed it. A lesson is
+  never closed automatically when its time ends.
+- Lateness is now measured against the real start **instant**: `startMinutes` is the
+  centre's local wall-clock time (`Center.timezone`, default `Africa/Cairo`), converted
+  with `src/lib/tz.ts`. (Before Stage 2 it was read as UTC, shifting every LATE decision
+  by the UTC offset.)
+- Nothing is dropped or renamed; no attendance, student, payment, exam, recitation or
+  teacher row is touched. Existing databases: apply
+  `prisma/sql/2026-10-stage2-lesson-plans.sql` (additive, idempotent) after the Stage 1
+  script. Fresh dev databases can use `prisma db push`.
+
+## Stage 3 — Exams, Recitation, Homework & Student performance
+
+Additive only (script: `prisma/sql/2026-10-stage3-performance.sql`, idempotent — apply it after the
+Stage 1 and 2 scripts; fresh dev databases can use `prisma db push` + `npm run db:seed`).
+
+- **`RecitationSession`** (new): one recitation per lesson of a group — `groupId`, `sessionId`
+  (→ `ClassSession`, unique), `date`, `maxScore`, optional `title`/`notes`.
+- **`Recitation.recitationSessionId`** (new, nullable FK): a student's recitation grade is a normal
+  `Recitation` row pointing at its `RecitationSession`; unique per `(recitationSessionId, studentId)`.
+  Old free-form rows keep it `NULL` and still work (tab "General records").
+- **`Assignment.sessionId`** (new, nullable FK → `ClassSession`): the lesson a homework belongs to.
+  Homework "Completed / Not completed" reuses `AssignmentSubmission.status`
+  (`SUBMITTED`/`LATE`/`GRADED` = completed, `MISSING` = not completed, `PENDING`/no row = not recorded).
+  New homework stores `maxScore = 0` (it is not graded). The older graded flow is kept in the
+  "Graded assignments (legacy)" tab.
+- **`StudentRecognition`** (new, insert-only): student, reason, date, notes, who recorded it.
+- **Exams**: no schema change. `ExamResult` already has `score` / `isAbsent` and a unique
+  `(examId, studentId)`; the new pages only add routes.
+- **Permissions**: `performance.view`, `performance.recognize` (granted by the script to
+  SUPER_ADMIN, CENTER_OWNER, MANAGER, TEACHER).
+
+Scoring methodology for the Student performance page is documented in `src/lib/performance.ts`
+(exams 35 · attendance 25 · homework 20 · recitation 20, missing categories re-weighted, minimum
+samples, ≥ 2 categories to be ranked) and shown to users on the page.
+
+Access rule used by all the new routes (`src/lib/group-access.ts`): organization → branch scope →
+teachers/assistants without `academic.groups.manage` only reach the groups they teach.
+Parent phone numbers never leave the server: the API returns a ready `wa.me` link (or a "no
+parent" / "invalid number" flag); nothing is sent automatically.

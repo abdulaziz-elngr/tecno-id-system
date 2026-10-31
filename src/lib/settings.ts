@@ -21,12 +21,15 @@ export interface PaymentRules {
   defaultMonthlyAmount: number;
   dueDayOfMonth: number;
   allowPartialPayments: boolean;
+  /** How many months ahead a cashier may collect (0 = advance payment disabled). */
+  advanceMonths: number;
 }
 
 export const DEFAULT_PAYMENT_RULES: PaymentRules = {
   defaultMonthlyAmount: 500,
   dueDayOfMonth: 5,
-  allowPartialPayments: true
+  allowPartialPayments: true,
+  advanceMonths: 1
 };
 
 async function readSetting<T>(organizationId: string, key: string, fallback: T): Promise<T> {

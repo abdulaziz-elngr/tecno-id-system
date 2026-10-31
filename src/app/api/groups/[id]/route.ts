@@ -11,6 +11,8 @@ import {
 import { handleApiError, ok, NotFoundError, BusinessRuleError, readJson } from "@/lib/api";
 import { writeAuditLog } from "@/lib/audit";
 import { isAssignableTeacher } from "@/lib/scope";
+import { countGroupDependencies, describeGroupBlockers, evaluateGroupDeletion } from "@/lib/group-safety";
+import { linkTeacherToSubject } from "@/lib/teacher-subjects";
 
 const SCOPE = "groups.detail";
 
@@ -49,6 +51,7 @@ export async function GET(_request: NextRequest, { params }: { params: { id: str
       },
       include: {
         grade: { select: { id: true, name: true, stage: { select: { id: true, name: true } } } },
+        subject: { select: { id: true, name: true, code: true } },
         teacher: { select: { id: true, fullName: true } },
         assistant: { select: { id: true, fullName: true } },
         schedules: { where: { isActive: true }, orderBy: { dayOfWeek: "asc" } },
@@ -76,15 +79,18 @@ export async function GET(_request: NextRequest, { params }: { params: { id: str
     resolveBranchScope(ctx, group.branchId);
 
     const currentCount = group.students.filter((s) => s.status === "ACTIVE").length;
+    const deletion = evaluateGroupDeletion(await countGroupDependencies(group.id));
 
     return ok({
       id: group.id,
+      branchId: group.branchId,
       name: group.name,
       capacity: group.capacity,
       notes: group.notes,
       isActive: group.isActive,
       grade: group.grade,
       stage: group.grade.stage,
+      subject: group.subject,
       teacher: group.teacher,
       assistant: group.assistant,
       schedules: group.schedules,
@@ -92,6 +98,8 @@ export async function GET(_request: NextRequest, { params }: { params: { id: str
       remaining: Math.max(0, group.capacity - currentCount),
       capacityPercent: group.capacity > 0 ? Math.round((currentCount / group.capacity) * 1000) / 10 : 0,
       isFull: currentCount >= group.capacity,
+      // Why (if at all) this group cannot be deleted — drives Delete vs Archive in the UI.
+      deletion: { canDelete: deletion.canDelete, blockers: deletion.blockers },
       students: group.students
     });
   } catch (err) {
@@ -101,6 +109,8 @@ export async function GET(_request: NextRequest, { params }: { params: { id: str
 
 const updateSchema = z.object({
   name: z.string().trim().min(1).max(100).optional(),
+  // Can be (re)assigned but not cleared: a group always belongs to one subject.
+  subjectId: z.string().uuid().optional(),
   teacherId: z.string().uuid().nullable().optional(),
   assistantId: z.string().uuid().nullable().optional(),
   capacity: z.number().int().min(1).max(2000).optional(),
@@ -134,9 +144,47 @@ export async function PATCH(request: NextRequest, { params }: { params: { id: st
       throw new BusinessRuleError("Invalid assistant.");
     }
 
-    const updated = await db.group.update({
-      where: { id: group.id },
-      data: input
+    if (input.subjectId && input.subjectId !== group.subjectId) {
+      const subject = await db.subject.findFirst({
+        where: { id: input.subjectId, organizationId: ctx.organizationId, deletedAt: null },
+        select: { id: true }
+      });
+      if (!subject) throw new BusinessRuleError("Invalid subject.");
+    }
+
+    // Name must stay unique per (grade, subject) — checked whenever either part changes.
+    const nextName = input.name ?? group.name;
+    const nextSubjectId = input.subjectId ?? group.subjectId;
+    if (input.name !== undefined || input.subjectId !== undefined) {
+      const clash = await db.group.findFirst({
+        where: {
+          id: { not: group.id },
+          gradeId: group.gradeId,
+          subjectId: nextSubjectId,
+          name: { equals: nextName, mode: "insensitive" }
+        },
+        select: { deletedAt: true }
+      });
+      if (clash) {
+        throw new BusinessRuleError(
+          clash.deletedAt
+            ? "A deleted group with this name already exists for this grade and subject. Choose a different name."
+            : "A group with this name already exists for this grade and subject.",
+          { status: 409, code: "GROUP_NAME_TAKEN" }
+        );
+      }
+    }
+
+    const updated = await db.$transaction(async (tx) => {
+      const row = await tx.group.update({
+        where: { id: group.id },
+        data: input
+      });
+      // Keep Subject -> Teacher in step with the group's responsible teacher.
+      if (row.teacherId && row.subjectId) {
+        await linkTeacherToSubject(tx, row.teacherId, row.subjectId);
+      }
+      return row;
     });
 
     await writeAuditLog({
@@ -159,16 +207,21 @@ export async function DELETE(_request: NextRequest, { params }: { params: { id: 
   try {
     const ctx = await requirePermission("academic.groups.manage");
     const group = await db.group.findFirst({
-      where: { id: params.id, deletedAt: null, branch: { center: { organizationId: ctx.organizationId } } },
-      include: { _count: { select: { students: { where: { deletedAt: null, status: "ACTIVE" } } } } }
+      where: { id: params.id, deletedAt: null, branch: { center: { organizationId: ctx.organizationId } } }
     });
     if (!group) throw new NotFoundError("Group not found.");
     resolveBranchScope(ctx, group.branchId);
 
-    if (group._count.students > 0) {
-      throw new BusinessRuleError(
-        "This group still has enrolled students. Deactivate it instead of deleting, or move the students first."
-      );
+    // A group can only be deleted if nothing depends on it. Students, sessions,
+    // attendance, exams, assignments and subscriptions all reference it, so any
+    // of them blocks deletion — the group must be archived (isActive = false)
+    // instead, which keeps all history intact.
+    const verdict = evaluateGroupDeletion(await countGroupDependencies(group.id));
+    if (!verdict.canDelete) {
+      throw new BusinessRuleError(describeGroupBlockers(verdict), {
+        code: "GROUP_HAS_DEPENDENCIES",
+        details: { blockers: verdict.blockers }
+      });
     }
 
     const deleted = await db.group.update({
